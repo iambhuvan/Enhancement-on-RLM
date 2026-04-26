@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Results and logs (large eval output)
+RLM/ERLM/EVALS/results/
+*.log
+*.jsonl
+
+# Secrets / credentials
+.env
+*.env
+credentials.json
+service_account*.json
+application_default_credentials.json
+
+# Claude / AI tool folders
+.claude/
+.claude-flow/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
