@@ -8,8 +8,7 @@ Optimisations wired here
 O1 — TF-IDF Prompt Indexer        (enable_indexing)
 O2 — Adaptive Budget Controller   (enable_budget)
 O3 — Async Subcall Manager        (enable_async)      → injects batched-API system prompt
-O4 — KV-cache Prefix Sharing      (enable_kv_cache)   → swaps backend to VLLMPrefixCachedClient
-O5 — FP-8 / INT8 Quantisation     (enable_fp8)        → configures quantization on vLLM client
+O4 — KV-cache Prefix Sharing      (enable_kv_cache)   → routes to vLLM with RadixAttention
 """
 
 from __future__ import annotations
@@ -44,8 +43,7 @@ from rlm.logger import RLMLogger  # noqa: E402
 from optimisations.prompt_indexer import PromptIndexer  # noqa: E402
 from optimisations.budget_controller import AdaptiveBudgetController  # noqa: E402
 from optimisations.async_subcall import AsyncSubcallManager  # noqa: E402
-from optimisations.kv_prefix_cache import VLLMPrefixCachedClient, create_vllm_client  # noqa: E402
-from optimisations.fp8_quantization import recommend_quantization, get_gpu_info  # noqa: E402
+from optimisations.kv_prefix_cache import create_vllm_client  # noqa: E402
 
 
 class EnhancedRLM(RLM):
@@ -54,7 +52,7 @@ class EnhancedRLM(RLM):
     All parameters accepted by the baseline ``RLM`` are forwarded unchanged.
     The additional keyword arguments documented below toggle optimisations that
     are either wired directly in this class (O1, O2) or stored as flags for
-    external modules (O3–O5).
+    external modules (O3–O4).
 
     Parameters
     ----------
@@ -69,9 +67,7 @@ class EnhancedRLM(RLM):
         O3 flag — Stored for use by ``async_subcall.py``.  Has no effect
         inside this class.
     enable_kv_cache:
-        O4 flag — Stored for future KV-cache pinning module.
-    enable_fp8:
-        O5 flag — Stored for future FP-8 quantisation module.
+        O4 — Routes to vLLM with --enable-prefix-caching (RadixAttention KV reuse).
     indexer_chunk_size:
         Character width of each TF-IDF chunk (O1).
     indexer_overlap:
@@ -122,7 +118,6 @@ class EnhancedRLM(RLM):
         enable_budget: bool = False,
         enable_async: bool = False,
         enable_kv_cache: bool = False,
-        enable_fp8: bool = False,
         # ---- O1 indexer params ----
         indexer_chunk_size: int = 2000,
         indexer_overlap: int = 200,
@@ -139,7 +134,6 @@ class EnhancedRLM(RLM):
         self.enable_budget = enable_budget
         self.enable_async = enable_async
         self.enable_kv_cache = enable_kv_cache
-        self.enable_fp8 = enable_fp8
 
         # ---- O1: build indexer, inject tool, augment system prompt ----
         self._indexer: PromptIndexer | None = None
@@ -193,29 +187,18 @@ class EnhancedRLM(RLM):
                 from rlm.utils.prompts import RLM_SYSTEM_PROMPT
                 custom_system_prompt = RLM_SYSTEM_PROMPT + _async_addon
 
-        # ---- O4 + O5: swap backend to VLLMPrefixCachedClient when kv_cache enabled ----
-        # O4 turns on prefix caching; O5 adds quantization.  Both work through vLLM.
+        # ---- O4: route to vLLM with prefix caching ----
         if enable_kv_cache:
-            _gpu = get_gpu_info()
-            _quant: str | None = None
-            if enable_fp8:
-                _qcfg = recommend_quantization(_gpu)
-                _quant = _qcfg.mode if _qcfg.mode != "none" else None
-
-            # Build the vLLM client and pass it as backend_kwargs so RLM uses it
             _vllm_port = (backend_kwargs or {}).get("port", 8001)
-            _vllm_model = (backend_kwargs or {}).get("model", "Qwen/Qwen3-8B")
-            _vllm_client = create_vllm_client(
-                model_name=_vllm_model,
-                quantization=_quant,
-                enable_prefix_caching=True,
-                port=_vllm_port,
-            )
-            # Override backend to openai-compatible; inject client into kwargs
-            backend = "openai"
-            backend_kwargs = backend_kwargs or {}
-            backend_kwargs = dict(backend_kwargs)
-            backend_kwargs["client"] = _vllm_client
+            _vllm_model = (backend_kwargs or {}).get("model_name", "Qwen/Qwen3-8B")
+            backend = "vllm"
+            backend_kwargs = dict(backend_kwargs or {})
+            if "base_url" not in backend_kwargs:
+                backend_kwargs["base_url"] = f"http://localhost:{_vllm_port}/v1"
+            backend_kwargs.setdefault("api_key", "EMPTY")
+            backend_kwargs.setdefault("model_name", _vllm_model)
+            backend_kwargs.pop("port", None)
+            backend_kwargs.pop("model", None)
 
         # ---- delegate to baseline RLM ----
         super().__init__(
@@ -370,7 +353,6 @@ class EnhancedRLM(RLM):
             "enable_budget": self.enable_budget,
             "enable_async": self.enable_async,
             "enable_kv_cache": self.enable_kv_cache,
-            "enable_fp8": self.enable_fp8,
         }
         if self._async_manager is not None:
             cfg["async_speedup_stats"] = self._async_manager.get_speedup_stats()

@@ -19,7 +19,6 @@
    - [O2 — Adaptive Budget Controller](#o2--adaptive-budget-controller)
    - [O3 — Async Parallel Subcall Manager](#o3--async-parallel-subcall-manager)
    - [O4 — KV-Cache Prefix Sharing](#o4--kv-cache-prefix-sharing)
-   - [O5 — FP8/INT8 Quantization](#o5--fp8int8-quantization)
 6. [Evaluation Design](#6-evaluation-design)
 7. [Metrics Explained](#7-metrics-explained)
 8. [How to Run](#8-how-to-run)
@@ -58,7 +57,7 @@ LLMSYS_FINAL_PROJECT/
 │   │           └── parsing.py      # find_final_answer() extractor
 │   │
 │   └── ERLM/                       # Our enhanced implementation
-│       ├── erlm.py                 # EnhancedRLM — subclass of RLM, wires O1–O5
+│       ├── erlm.py                 # EnhancedRLM — subclass of RLM, wires O1–O4
 │       ├── clients/
 │       │   ├── vertex_ai.py        # Vertex AI MaaS client (Qwen3-480B)
 │       │   └── ollama.py           # Local Ollama client (Qwen3-8B, think:false)
@@ -66,8 +65,7 @@ LLMSYS_FINAL_PROJECT/
 │       │   ├── prompt_indexer.py   # O1: TF-IDF indexer + search_context() tool
 │       │   ├── budget_controller.py # O2: Adaptive early termination
 │       │   ├── async_subcall.py    # O3: Parallel batching instructions + stats
-│       │   ├── kv_prefix_cache.py  # O4: vLLM prefix caching client
-│       │   └── fp8_quantization.py # O5: FP8/INT8 quantization config
+│       │   └── kv_prefix_cache.py  # O4: vLLM prefix caching client
 │       └── EVALS/
 │           ├── compare.py          # Main evaluation harness
 │           ├── benchmarks/
@@ -112,7 +110,7 @@ Each iteration = at least one LLM API call. With `max_iterations=5` and sub-call
 
 ## 4. What is ERLM?
 
-`EnhancedRLM` is a subclass of `RLM` (no modifications to BASELINE) that adds five optional optimizations via constructor flags:
+`EnhancedRLM` is a subclass of `RLM` (no modifications to BASELINE) that adds four optional optimizations via constructor flags:
 
 ```python
 from erlm import EnhancedRLM
@@ -125,8 +123,7 @@ model = EnhancedRLM(
     enable_indexing=True,   # O1
     enable_budget=True,     # O2
     enable_async=True,      # O3
-    enable_kv_cache=False,  # O4 (requires vLLM server)
-    enable_fp8=False,       # O5 (requires NVIDIA GPU)
+    enable_kv_cache=False,  # O4 (requires vLLM server with --enable-prefix-caching)
 )
 
 result = model.completion(document, root_prompt=question)
@@ -271,23 +268,6 @@ vllm serve Qwen/Qwen3-8B --enable-prefix-caching --port 8001
 **Note:** O4 requires an NVIDIA GPU and is not evaluated in the current Ollama-based setup. It's implemented and available for GPU cluster runs.
 
 ---
-
-### O5 — FP8/INT8 Quantization
-
-**File:** `ERLM/optimisations/fp8_quantization.py`  
-**Flag:** `enable_fp8=True` (requires `enable_kv_cache=True`)  
-**Requirement:** NVIDIA A100/H100 GPU
-
-#### Problem
-Qwen3-8B in BF16 requires ~16GB of GPU memory. This leaves little room for KV cache and limits batch size, reducing throughput.
-
-#### Solution
-O5 detects GPU capabilities and recommends the best quantization:
-- **A100/H100:** FP8 weight quantization via `vllm --quantization fp8` — ~2x memory reduction with minimal accuracy loss
-- **Other NVIDIA:** INT8 (bitsandbytes) — ~2x memory reduction, slightly higher accuracy loss
-- **No GPU / Mac:** No-op (quantization skipped)
-
-**Note:** O5 is implemented but not evaluated in the current Ollama setup. Relevant for GPU cluster deployments.
 
 ---
 

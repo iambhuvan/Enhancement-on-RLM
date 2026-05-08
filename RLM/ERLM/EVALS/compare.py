@@ -327,7 +327,6 @@ def build_erlm(backend_kwargs: dict[str, Any], o1: bool, o2: bool, o3: bool,
         enable_budget=o2,
         enable_async=o3,
         enable_kv_cache=False,
-        enable_fp8=False,
     )
 
 

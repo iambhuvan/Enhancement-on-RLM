@@ -139,9 +139,6 @@ class VLLMPrefixCachedClient(BaseLM):
     enable_prefix_caching:
         Informational flag — prefix caching is enforced server-side.
         Stored so callers can confirm the expected server config.
-    quantization:
-        Quantization scheme used when the server was launched (e.g.
-        ``"fp8"``, ``"int8"``).  Stored for metadata purposes only.
     max_tokens:
         Maximum number of tokens to generate per completion.
     temperature:
@@ -156,7 +153,6 @@ class VLLMPrefixCachedClient(BaseLM):
         base_url: str = "http://localhost:8001/v1",
         api_key: str = "EMPTY",
         enable_prefix_caching: bool = True,
-        quantization: str | None = None,
         max_tokens: int = 2048,
         temperature: float = 0.0,
         timeout: float = 300.0,
@@ -172,7 +168,6 @@ class VLLMPrefixCachedClient(BaseLM):
         self.base_url: str = base_url
         self.api_key: str = api_key
         self.enable_prefix_caching: bool = enable_prefix_caching
-        self.quantization: str | None = quantization
         self.max_tokens: int = max_tokens
         self.temperature: float = temperature
 
@@ -418,17 +413,31 @@ class VLLMPrefixCachedClient(BaseLM):
         if text is None:
             return {}
 
-        target_metrics = [
-            "vllm:gpu_prefix_cache_hit_rate",
-            "vllm:gpu_cache_usage_perc",
-            "vllm:avg_prompt_throughput_toks_per_s",
-        ]
-
         result: dict[str, float] = {}
-        for name in target_metrics:
-            value = _parse_prometheus_metric(text, name)
-            if value is not None:
-                result[name] = value
+
+        # vLLM ≥0.19: prefix cache exposed as counters (hits + queries),
+        # compute hit rate = hits / queries.  Fall back to the legacy gauge
+        # name (vllm:gpu_prefix_cache_hit_rate) used in older versions.
+        hits    = _parse_prometheus_metric(text, "vllm:prefix_cache_hits_total")
+        queries = _parse_prometheus_metric(text, "vllm:prefix_cache_queries_total")
+        if hits is not None and queries is not None and queries > 0:
+            result["vllm:gpu_prefix_cache_hit_rate"] = hits / queries
+        else:
+            legacy = _parse_prometheus_metric(text, "vllm:gpu_prefix_cache_hit_rate")
+            if legacy is not None:
+                result["vllm:gpu_prefix_cache_hit_rate"] = legacy
+
+        # GPU KV cache occupancy — same name across versions
+        kv_usage = _parse_prometheus_metric(text, "vllm:kv_cache_usage_perc")
+        if kv_usage is not None:
+            result["vllm:gpu_cache_usage_perc"] = kv_usage
+
+        # Prompt throughput — may vary; try both names
+        pt = _parse_prometheus_metric(text, "vllm:avg_prompt_throughput_toks_per_s")
+        if pt is None:
+            pt = _parse_prometheus_metric(text, "vllm:prompt_throughput_toks_per_s")
+        if pt is not None:
+            result["vllm:avg_prompt_throughput_toks_per_s"] = pt
 
         return result
 
@@ -475,7 +484,6 @@ class VLLMPrefixCachedClient(BaseLM):
 
 def create_vllm_client(
     model_name: str = "Qwen/Qwen3-8B",
-    quantization: str | None = None,
     enable_prefix_caching: bool = True,
     port: int = 8001,
 ) -> VLLMPrefixCachedClient:
@@ -486,8 +494,6 @@ def create_vllm_client(
     ----------
     model_name:
         HuggingFace model ID to query (must match the model served by vLLM).
-    quantization:
-        Quantization scheme the server was launched with (metadata only).
     enable_prefix_caching:
         Whether prefix caching is expected on the server (metadata only).
     port:
@@ -504,14 +510,12 @@ def create_vllm_client(
         base_url=base_url,
         api_key="EMPTY",
         enable_prefix_caching=enable_prefix_caching,
-        quantization=quantization,
     )
 
 
 def get_vllm_server_command(
     model_name: str = "Qwen/Qwen3-8B",
     port: int = 8001,
-    quantization: str | None = None,
     enable_prefix_caching: bool = True,
 ) -> str:
     """
@@ -524,9 +528,6 @@ def get_vllm_server_command(
         HuggingFace model ID to serve.
     port:
         Port to bind the HTTP server on.
-    quantization:
-        Quantization flag passed to ``--quantization`` (e.g. ``"fp8"``).
-        Omitted from the command when ``None``.
     enable_prefix_caching:
         When ``True``, adds ``--enable-prefix-caching`` (RadixAttention).
 
@@ -538,9 +539,8 @@ def get_vllm_server_command(
 
     Example
     -------
-    >>> print(get_vllm_server_command("Qwen/Qwen3-8B", port=8001, quantization="fp8"))
-    vllm serve Qwen/Qwen3-8B --port 8001 --enable-prefix-caching \
-        --quantization fp8 --gpu-memory-utilization 0.85
+    >>> print(get_vllm_server_command("Qwen/Qwen3-8B", port=8001))
+    vllm serve Qwen/Qwen3-8B --port 8001 --enable-prefix-caching --gpu-memory-utilization 0.85
     """
     parts = [
         "vllm",
@@ -552,9 +552,6 @@ def get_vllm_server_command(
 
     if enable_prefix_caching:
         parts.append("--enable-prefix-caching")
-
-    if quantization is not None:
-        parts += ["--quantization", quantization]
 
     parts += ["--gpu-memory-utilization", "0.85"]
 

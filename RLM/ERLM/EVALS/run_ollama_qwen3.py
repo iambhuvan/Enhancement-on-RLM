@@ -66,13 +66,13 @@ _OLLAMA_BASE_URL  = "http://localhost:11434/v1"
 _BASE_MODEL_DOC_CHARS = 450_000
 
 # RLM loop settings — local Ollama can be slow, give generous timeout
-_MAX_ITERATIONS = 3
+_MAX_ITERATIONS = 5
 _MAX_TIMEOUT_S  = 600.0   # 10 min per sample; local inference varies widely
 
-# CodeQA sample selection — same 50 docs across all models (seed=42)
-# All docs exceed Qwen3-8B context → every sample puts pressure on RLM/ERLM
-_MIN_DOC_LENGTH = 800_000
-_MAX_DOC_LENGTH = 4_000_000
+# CodeQA sample selection defaults — override with --min_doc_chars / --max_doc_chars
+# "short" label in LongBench-v2 ≈ 32K-128K chars; keep well within Ollama context
+_MIN_DOC_LENGTH = 50_000
+_MAX_DOC_LENGTH = 120_000
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -148,10 +148,22 @@ def _extract_final_answer(text: str) -> str:
     import re
     # Strip <think>...</think> blocks (Qwen3 thinking mode)
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-    # FINAL("C") / FINAL('c') / FINAL(C) — single letter
+    # FINAL("C") / FINAL('c') / FINAL(C) — single letter in parens
     m = re.search(r'FINAL\s*\(\s*["\']?\s*([A-Da-d])\s*["\']?\s*\)', text)
     if m:
         return m.group(1)
+    # FINAL_C / FINAL_c — underscore variant
+    m = re.search(r'\bFINAL_([A-Da-d])\b', text)
+    if m:
+        return m.group(1)
+    # Bullet evaluation format: "Statement C ... → **Yes**" / "C. ... → Yes (correct)"
+    # Find the LAST option marked as Yes/correct in evaluation-style answers
+    hits = re.findall(
+        r'\b([A-Da-d])\b[^→\n]*→[^→\n]*(?:\*\*)?(?:Yes|Correct|True)(?:\*\*)?',
+        text, re.IGNORECASE
+    )
+    if hits:
+        return hits[-1]
     # "the answer is C" / "answer: C" / "Answer (C)" / "(C)"
     m = re.search(r'(?:answer(?:s)?(?:\s+is|\s*:|\s+option|\s+choice)?\s*[\(\["\'\s]*)([A-Da-d])\b', text, re.IGNORECASE)
     if m:
@@ -175,6 +187,14 @@ def _extract_final_answer(text: str) -> str:
         lm = re.search(r'\b([A-Da-d])\b', inner)
         if lm:
             return lm.group(1)
+    # FINAL(variable_name) — model passed a variable instead of a letter.
+    # Scan the 300 chars BEFORE the FINAL call for the last mentioned letter.
+    m = re.search(r'FINAL\s*\(\s*([A-Za-z_]\w*)\s*\)', text)
+    if m:
+        before = text[:m.start()][-300:]
+        letters = re.findall(r'\b([A-Da-d])\b', before)
+        if letters:
+            return letters[-1]
     return text
 
 def exact_match(pred: str, gold: str) -> float:
@@ -264,12 +284,32 @@ class _BaseModelWrapper:
 def build_base_model(bkw: dict[str, Any]) -> _BaseModelWrapper:
     return _BaseModelWrapper(bkw)
 
+def _mcq_system_prompt() -> str:
+    from rlm.utils.prompts import RLM_SYSTEM_PROMPT
+    addendum = (
+        "\n\n"
+        "═══ MCQ ANSWER RULE — READ CAREFULLY ═══\n"
+        "When answering a multiple-choice question (options A / B / C / D):\n"
+        "  • Your FINAL() call MUST contain ONLY the bare letter. Correct: FINAL(A)  FINAL(B)  FINAL(C)  FINAL(D)\n"
+        "  • WRONG (variable names): FINAL(answer) FINAL(my_choice) FINAL(result) FINAL(selected)\n"
+        "    FINAL(correct_answer) FINAL(correct_option) FINAL(best_answer) FINAL(analysis)\n"
+        "    FINAL(final_answer) FINAL(option) FINAL(choice) FINAL(best_interpretation)\n"
+        "  • WRONG (sentences): FINAL(The answer is B) — only ONE letter, nothing else.\n"
+        "  • Do NOT store the letter in a variable and pass the variable: write FINAL(B) not final_ans='B'; FINAL(final_ans)\n"
+        "  • The moment you know the answer, write it: FINAL(A) or FINAL(B) or FINAL(C) or FINAL(D). Done.\n"
+        "  • Do NOT revise your answer after writing FINAL — stop immediately after.\n"
+        "═══════════════════════════════════════"
+    )
+    return RLM_SYSTEM_PROMPT + addendum
+
+
 def build_rlm_baseline(bkw: dict[str, Any]) -> Any:
     from rlm.core.rlm import RLM
     _iters = [0]
     m = RLM(
         backend="ollama", backend_kwargs=bkw,
         max_depth=1, max_iterations=_MAX_ITERATIONS, max_timeout=_MAX_TIMEOUT_S,
+        custom_system_prompt=_mcq_system_prompt(),
         on_iteration_complete=lambda i, d, e: _iters.__setitem__(0, i + 1),
     )
     m._erlm_iter_count = _iters
@@ -281,12 +321,13 @@ def build_erlm(bkw: dict[str, Any], o1: bool, o2: bool, o3: bool) -> Any:
     m = EnhancedRLM(
         backend="ollama", backend_kwargs=bkw,
         max_depth=1, max_iterations=_MAX_ITERATIONS, max_timeout=_MAX_TIMEOUT_S,
-        max_tokens=50_000,          # O2 budget: ~10% of 128K Qwen3 context (450K chars cap)
+        max_tokens=35_000,          # O2 budget: hard cap to prevent TokenLimitExceededError
         enable_indexing=o1, enable_budget=o2, enable_async=o3,
-        enable_kv_cache=False, enable_fp8=False,
+        enable_kv_cache=False,
         indexer_chunk_size=1000,    # Fix O1: was 2000; 1000 chars × 3 = 3K chars/query
         indexer_overlap=100,        # proportional to chunk_size
         indexer_top_k=3,            # Fix O1: was 5; reduces per-query token cost 3.3×
+        custom_system_prompt=_mcq_system_prompt(),
         on_iteration_complete=lambda i, d, e: _iters.__setitem__(0, i + 1),
     )
     m._erlm_iter_count = _iters
@@ -311,13 +352,25 @@ def run_sample(
         if isinstance(model, _BaseModelWrapper):
             result = model.completion(document, question)
         else:
-            _mc_hint = "\n\nIMPORTANT: Your final answer must be a single letter only: A, B, C, or D."
+            _mc_hint = (
+                "\n\nFINAL ANSWER REQUIRED: Call FINAL(X) where X is exactly ONE letter: A, B, C, or D."
+                " Write the letter directly — e.g. FINAL(B) — not a variable name."
+            )
             result = model.completion(document, root_prompt=question + _mc_hint)
 
-        prediction = (
+        raw_pred = (
             getattr(result, "response", None)
             or getattr(result, "final_answer", None) or ""
         )
+        import re as _re
+        # If model put entire response inside <think>...</think> (Qwen3 think-only),
+        # extract the last A/B/C/D mentioned inside the thinking as a fallback.
+        stripped = _re.sub(r'<think>.*?</think>', '', raw_pred, flags=_re.DOTALL).strip()
+        if not stripped:
+            think_content = "".join(_re.findall(r'<think>(.*?)</think>', raw_pred, _re.DOTALL))
+            letters = _re.findall(r'\b([A-Da-d])\b', think_content)
+            stripped = letters[-1].upper() if letters else raw_pred
+        prediction = stripped
         us = getattr(result, "usage_summary", None) or getattr(result, "usage", None)
         if us is not None:
             input_tokens  = getattr(us, "total_input_tokens", 0)
@@ -360,7 +413,7 @@ def run_sample(
 
     return SampleResult(
         model=_MODEL_NAME, dataset="codeqa", sample_id=sample_id, method=method,
-        prediction=prediction[:500], ground_truth=gold,
+        prediction=prediction[:1500], ground_truth=gold,
         exact_match=em, f1=f1,
         tokens_used=tokens_used, input_tokens=input_tokens, output_tokens=output_tokens,
         tokens_per_sec=tokens_per_sec, iterations=iterations,
@@ -462,7 +515,21 @@ def main() -> None:
                         help="Ollama model tag (default: qwen3:8b)")
     parser.add_argument("--out",        default=f"results/{_MODEL_LABEL}",
                         help="Output directory")
+    parser.add_argument("--min_doc_chars", type=int, default=None,
+                        help=f"Override min doc length (default: {_MIN_DOC_LENGTH})")
+    parser.add_argument("--max_doc_chars", type=int, default=None,
+                        help=f"Override max doc length (default: {_MAX_DOC_LENGTH})")
+    parser.add_argument("--difficulty", nargs="+", default=None,
+                        choices=["easy", "hard"],
+                        help="Filter by difficulty (e.g. --difficulty easy)")
+    parser.add_argument("--length_label", nargs="+", default=None,
+                        choices=["short", "medium", "long"],
+                        help="Filter by dataset length label (e.g. --length_label short)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    min_doc = args.min_doc_chars if args.min_doc_chars else _MIN_DOC_LENGTH
+    max_doc = args.max_doc_chars if args.max_doc_chars else _MAX_DOC_LENGTH
 
     os.makedirs(args.out, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -477,7 +544,9 @@ def main() -> None:
     log.info(f"Base-model cap : {_BASE_MODEL_DOC_CHARS:,} chars")
     log.info(f"Samples        : {args.n}")
     log.info(f"Methods        : {args.methods}")
-    log.info(f"Doc length     : {_MIN_DOC_LENGTH:,} – {_MAX_DOC_LENGTH:,} chars")
+    log.info(f"Doc length     : {min_doc:,} – {max_doc:,} chars")
+    log.info(f"Difficulty     : {args.difficulty or 'any'}")
+    log.info(f"Length label   : {args.length_label or 'any'}")
     log.info(f"Max iterations : {_MAX_ITERATIONS}")
     log.info(f"Timeout/sample : {_MAX_TIMEOUT_S}s")
     log.info(f"Output dir     : {args.out}")
@@ -497,13 +566,16 @@ def main() -> None:
 
     ds = CodeQADataset(
         max_samples=args.n,
-        min_doc_length=_MIN_DOC_LENGTH,
-        max_doc_length=_MAX_DOC_LENGTH,
+        min_doc_length=min_doc,
+        max_doc_length=max_doc,
+        difficulties=args.difficulty,
+        length_labels=args.length_label,
+        seed=args.seed,
     ).load()
 
     if not ds:
         log.error(
-            f"No samples found with doc length {_MIN_DOC_LENGTH:,}–{_MAX_DOC_LENGTH:,} chars."
+            f"No samples found with doc length {min_doc:,}–{max_doc:,} chars."
         )
         return
 
@@ -512,15 +584,22 @@ def main() -> None:
     all_results: list[SampleResult] = []
 
     for i, sample in enumerate(ds):
+        # Format question with MC options so model sees what A/B/C/D mean
+        if sample.choices:
+            opts = "\n".join(f"{k}. {v}" for k, v in sorted(sample.choices.items()))
+            question = f"{sample.question}\n\n{opts}"
+        else:
+            question = sample.question
+
         log.info(f"[codeqa] Sample {i+1}/{len(ds)} id={sample.id}  "
-                 f"doc_chars={len(sample.document):,}  q={sample.question[:80]!r}")
+                 f"doc_chars={len(sample.document):,}  q={question[:80]!r}")
 
         for method in args.methods:
             log.info(f"  → running {method}…")
             result = run_sample(
                 model_fn=_factory(method),
                 document=sample.document,
-                question=sample.question,
+                question=question,
                 gold=sample.answer,
                 sample_id=str(sample.id),
                 method=method,

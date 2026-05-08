@@ -285,7 +285,7 @@ def build_erlm(bkw: dict[str, Any], o1: bool, o2: bool, o3: bool) -> Any:
         max_depth=1, max_iterations=_MAX_ITERATIONS, max_timeout=_MAX_TIMEOUT_S,
         max_tokens=20_000_000,      # O2 budget: gemini_vertex counts chars not tokens; 4M char doc × 5 overhead = 20M
         enable_indexing=o1, enable_budget=o2, enable_async=o3,
-        enable_kv_cache=False, enable_fp8=False,
+        enable_kv_cache=False,
         indexer_chunk_size=1000,    # Fix O1: was 2000; 1000 chars × 3 = 3K chars/query
         indexer_overlap=100,        # proportional to chunk_size
         indexer_top_k=3,            # Fix O1: was 5; reduces per-query token cost 3.3×

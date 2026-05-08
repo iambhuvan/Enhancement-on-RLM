@@ -4,11 +4,10 @@ run_vllm_qwen3.py — LongBench-v2 CodeQA eval using Qwen3-8B via vLLM (Modal)
 Evaluates four methods on LongBench-v2 CodeQA samples using Qwen3-8B
 served by a vLLM endpoint (e.g. deployed via modal_vllm_server.py).
 
-Adds O4 (KV prefix cache) and O5 (quantization) on top of O1-O3.
+Adds O4 (KV prefix cache) on top of O1-O3.
 Tracks additional metrics vs run_ollama_qwen3.py:
   - Time to First Token (TTFT, ms)
   - KV cache hit rate (% from vLLM Prometheus /metrics)
-  - GPU memory usage (GB, if torch available in vLLM container)
   - Tokens/sec speedup over Ollama baseline
 
 Methods
@@ -17,7 +16,7 @@ Methods
   rlm_baseline   — RLM iterative REPL loop via vLLM
   erlm_o1o2      — ERLM with O1 (TF-IDF) + O2 (budget) via vLLM
   erlm_o1o2o3    — ERLM with O1 + O2 + O3 (async) via vLLM
-  All methods benefit from O4 (prefix cache) and O5 (quantization) server-side.
+  All methods benefit from O4 (prefix cache) server-side.
 
 Requirements
 ------------
@@ -27,7 +26,6 @@ Requirements
 Usage
 -----
     python run_vllm_qwen3.py --n 50 --vllm_url https://YOUR-MODAL-URL
-    python run_vllm_qwen3.py --n 3  --vllm_url https://YOUR-MODAL-URL --quantization int8
     python run_vllm_qwen3.py --n 50 --vllm_url https://YOUR-MODAL-URL --methods erlm_o1o2o3
 """
 
@@ -65,12 +63,13 @@ _MODEL_LABEL    = "vllm_qwen3_8b"
 
 # Same doc window as Ollama Qwen3 for fair comparison
 _BASE_MODEL_DOC_CHARS = 450_000
-_MAX_ITERATIONS = 3
+_MAX_ITERATIONS = 5
 _MAX_TIMEOUT_S  = 600.0
 
-# Same sample selection as other eval scripts
-_MIN_DOC_LENGTH = 800_000
-_MAX_DOC_LENGTH = 4_000_000
+# A100 max_model_len=32768 tokens ≈ 120K chars; keep docs under that so RLM
+# chunks fit in context. Use --min_doc_chars / --max_doc_chars to override.
+_MIN_DOC_LENGTH = 50_000
+_MAX_DOC_LENGTH = 120_000
 
 # Ollama baseline tok/s for speedup calculation (from sanity runs)
 _OLLAMA_BASELINE_TOKPS = 115.0
@@ -99,7 +98,7 @@ def _setup_logging(log_dir: str, ts: str, label: str) -> logging.Logger:
 log = logging.getLogger(_MODEL_LABEL)
 
 # ---------------------------------------------------------------------------
-# Result dataclass — extends base with O4/O5 metrics
+# Result dataclass — extends base with O4 metrics
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -108,7 +107,6 @@ class SampleResult:
     dataset:             str
     sample_id:           str
     method:              str
-    quantization:        str
     prediction:          str
     ground_truth:        str
     exact_match:         float
@@ -120,7 +118,7 @@ class SampleResult:
     speedup_vs_ollama:   float
     ttft_ms:             float     # O4: time to first token
     kv_cache_hit_rate:   float     # O4: prefix cache hit %
-    gpu_memory_gb:       float     # O5: VRAM used
+    gpu_memory_gb:       float
     iterations:          int
     wall_clock_s:        float
     error:               str   = ""
@@ -153,10 +151,21 @@ def _extract_final_answer(text: str) -> str:
     import re
     # Strip <think>...</think> blocks (Qwen3 thinking mode)
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-    # FINAL("C") / FINAL('c') / FINAL(C) — single letter
+    # FINAL("C") / FINAL('c') / FINAL(C) — single letter in parens
     m = re.search(r'FINAL\s*\(\s*["\']?\s*([A-Da-d])\s*["\']?\s*\)', text)
     if m:
         return m.group(1)
+    # FINAL_C / FINAL_c — underscore variant
+    m = re.search(r'\bFINAL_([A-Da-d])\b', text)
+    if m:
+        return m.group(1)
+    # Bullet evaluation format: "Statement C ... → **Yes**"
+    hits = re.findall(
+        r'\b([A-Da-d])\b[^→\n]*→[^→\n]*(?:\*\*)?(?:Yes|Correct|True)(?:\*\*)?',
+        text, re.IGNORECASE
+    )
+    if hits:
+        return hits[-1]
     # "the answer is C" / "answer: C" / "Answer (C)"
     m = re.search(r'(?:answer(?:s)?(?:\s+is|\s*:|\s+option|\s+choice)?\s*[\(\["\'\s]*)([A-Da-d])\b', text, re.IGNORECASE)
     if m:
@@ -180,6 +189,14 @@ def _extract_final_answer(text: str) -> str:
         lm = re.search(r'\b([A-Da-d])\b', inner)
         if lm:
             return lm.group(1)
+    # FINAL(variable_name) — model passed a variable instead of a letter.
+    # Scan the 300 chars BEFORE the FINAL call for the last mentioned letter.
+    m = re.search(r'FINAL\s*\(\s*([A-Za-z_]\w*)\s*\)', text)
+    if m:
+        before = text[:m.start()][-300:]
+        letters = re.findall(r'\b([A-Da-d])\b', before)
+        if letters:
+            return letters[-1]
     return text
 
 def exact_match(pred: str, gold: str) -> float:
@@ -210,7 +227,7 @@ def f1_score(pred: str, gold: str) -> float:
 # vLLM client factory
 # ---------------------------------------------------------------------------
 
-def _make_vllm_client(vllm_url: str, quantization: str) -> Any:
+def _make_vllm_client(vllm_url: str) -> Any:
     """Create a VLLMPrefixCachedClient pointing to the Modal endpoint."""
     sys.path.insert(0, os.path.join(_ERLM_DIR, "optimisations"))
     from kv_prefix_cache import VLLMPrefixCachedClient
@@ -220,33 +237,69 @@ def _make_vllm_client(vllm_url: str, quantization: str) -> Any:
         base_url=base_url,
         api_key="EMPTY",
         enable_prefix_caching=True,
-        quantization=quantization if quantization != "none" else None,
         max_tokens=4096,
         temperature=0.0,
         timeout=300.0,
     )
 
 def _get_kv_cache_metrics(vllm_url: str) -> dict[str, float]:
-    """Scrape vLLM Prometheus metrics from the Modal endpoint."""
+    """Scrape vLLM Prometheus metrics from the Modal endpoint.
+
+    vLLM ≥0.19 renamed the prefix-cache gauge to two counters:
+      vllm:prefix_cache_hits_total / vllm:prefix_cache_queries_total
+    Hit rate is computed as hits/queries.  Older versions still export
+    the legacy vllm:gpu_prefix_cache_hit_rate gauge — we fall back to that.
+    """
     try:
         import httpx
         metrics_url = vllm_url.rstrip("/") + "/metrics"
-        r = httpx.get(metrics_url, timeout=5.0)
+        r = httpx.get(metrics_url, timeout=10.0)
         if r.status_code != 200:
             return {}
         text = r.text
-        result = {}
-        for name in ["vllm:gpu_prefix_cache_hit_rate", "vllm:gpu_cache_usage_perc",
-                     "vllm:avg_prompt_throughput_toks_per_s"]:
+
+        def _scalar(name: str) -> float | None:
             for line in text.splitlines():
-                if line.strip().startswith(name) and not line.startswith("#"):
-                    parts = line.strip().split()
+                s = line.strip()
+                if s.startswith("#") or not s:
+                    continue
+                if s.startswith(name):
+                    rem = s[len(name):]
+                    if rem.startswith("{"):
+                        close = rem.find("}")
+                        if close == -1:
+                            continue
+                        rem = rem[close + 1:]
+                    parts = rem.strip().split()
                     if parts:
                         try:
-                            result[name] = float(parts[-1])
+                            return float(parts[0])
                         except ValueError:
                             pass
-                    break
+            return None
+
+        result: dict[str, float] = {}
+
+        # vLLM ≥0.19: counters
+        hits    = _scalar("vllm:prefix_cache_hits_total")
+        queries = _scalar("vllm:prefix_cache_queries_total")
+        if hits is not None and queries is not None and queries > 0:
+            result["vllm:gpu_prefix_cache_hit_rate"] = hits / queries
+        else:
+            legacy = _scalar("vllm:gpu_prefix_cache_hit_rate")
+            if legacy is not None:
+                result["vllm:gpu_prefix_cache_hit_rate"] = legacy
+
+        kv = _scalar("vllm:kv_cache_usage_perc")
+        if kv is not None:
+            result["vllm:gpu_cache_usage_perc"] = kv
+
+        pt = _scalar("vllm:avg_prompt_throughput_toks_per_s")
+        if pt is None:
+            pt = _scalar("vllm:prompt_throughput_toks_per_s")
+        if pt is not None:
+            result["vllm:avg_prompt_throughput_toks_per_s"] = pt
+
         return result
     except Exception:
         return {}
@@ -297,7 +350,7 @@ class _BaseModelWrapper:
         usage = self._client.get_usage_summary() if hasattr(self._client, "get_usage_summary") else None
         return RLMChatCompletion(
             root_model=_HF_MODEL_NAME, prompt=prompt, response=response_text,
-            usage_summary=usage or UsageSummary(model_usage={}),
+            usage_summary=usage or UsageSummary(model_usage_summaries={}),
             execution_time=elapsed,
         )
 
@@ -308,30 +361,50 @@ class _BaseModelWrapper:
 def build_base_model(vllm_client: Any) -> _BaseModelWrapper:
     return _BaseModelWrapper(vllm_client)
 
+def _mcq_system_prompt() -> str:
+    from rlm.utils.prompts import RLM_SYSTEM_PROMPT
+    addendum = (
+        "\n\n"
+        "═══ MCQ ANSWER RULE — READ CAREFULLY ═══\n"
+        "When answering a multiple-choice question (options A / B / C / D):\n"
+        "  • Your FINAL() call MUST contain ONLY the bare letter. Correct: FINAL(A)  FINAL(B)  FINAL(C)  FINAL(D)\n"
+        "  • WRONG (variable names): FINAL(answer) FINAL(my_choice) FINAL(result) FINAL(selected)\n"
+        "    FINAL(correct_answer) FINAL(correct_option) FINAL(best_answer) FINAL(analysis)\n"
+        "    FINAL(final_answer) FINAL(option) FINAL(choice) FINAL(best_interpretation)\n"
+        "  • WRONG (sentences): FINAL(The answer is B) — only ONE letter, nothing else.\n"
+        "  • Do NOT store the letter in a variable and pass the variable: write FINAL(B) not final_ans='B'; FINAL(final_ans)\n"
+        "  • The moment you know the answer, write it: FINAL(A) or FINAL(B) or FINAL(C) or FINAL(D). Done.\n"
+        "  • Do NOT revise your answer after writing FINAL — stop immediately after.\n"
+        "═══════════════════════════════════════"
+    )
+    return RLM_SYSTEM_PROMPT + addendum
+
+
 def build_rlm_baseline(bkw: dict[str, Any]) -> Any:
     from rlm.core.rlm import RLM
     _iters = [0]
     m = RLM(
-        backend="ollama", backend_kwargs=bkw,
+        backend="vllm", backend_kwargs=bkw,
         max_depth=1, max_iterations=_MAX_ITERATIONS, max_timeout=_MAX_TIMEOUT_S,
+        custom_system_prompt=_mcq_system_prompt(),
         on_iteration_complete=lambda i, d, e: _iters.__setitem__(0, i + 1),
     )
     m._erlm_iter_count = _iters
     return m
 
-def build_erlm(bkw: dict[str, Any], o1: bool, o2: bool, o3: bool) -> Any:
+def build_erlm(bkw: dict[str, Any], o1: bool, o2: bool, o3: bool, o4: bool = False) -> Any:
     from erlm import EnhancedRLM
     _iters = [0]
     m = EnhancedRLM(
-        backend="ollama", backend_kwargs=bkw,
+        backend="vllm", backend_kwargs=bkw,
         max_depth=1, max_iterations=_MAX_ITERATIONS, max_timeout=_MAX_TIMEOUT_S,
-        max_tokens=50_000,           # O2 budget (token-accurate with vLLM)
+        max_tokens=35_000,
         enable_indexing=o1, enable_budget=o2, enable_async=o3,
-        enable_kv_cache=True,        # O4: flag for metadata tracking
-        enable_fp8=False,            # O5: handled server-side by vLLM
+        enable_kv_cache=o4,
         indexer_chunk_size=1000,
         indexer_overlap=100,
         indexer_top_k=3,
+        custom_system_prompt=_mcq_system_prompt(),
         on_iteration_complete=lambda i, d, e: _iters.__setitem__(0, i + 1),
     )
     m._erlm_iter_count = _iters
@@ -344,7 +417,7 @@ def build_erlm(bkw: dict[str, Any], o1: bool, o2: bool, o3: bool) -> Any:
 def run_sample(
     model_fn, document: str, question: str,
     gold: str, sample_id: str, method: str,
-    vllm_url: str, quantization: str, vllm_client: Any,
+    vllm_url: str, vllm_client: Any,
 ) -> SampleResult:
     t0 = time.perf_counter()
     prediction = ""; tokens_used = 0; input_tokens = 0; output_tokens = 0
@@ -360,13 +433,23 @@ def run_sample(
         if isinstance(model, _BaseModelWrapper):
             result = model.completion(document, question)
         else:
-            _mc_hint = "\n\nIMPORTANT: Your final answer must be a single letter only: A, B, C, or D."
+            _mc_hint = (
+                "\n\nFINAL ANSWER REQUIRED: Call FINAL(X) where X is exactly ONE letter: A, B, C, or D."
+                " Write the letter directly — e.g. FINAL(B) — not a variable name."
+            )
             result = model.completion(document, root_prompt=question + _mc_hint)
 
-        prediction = (
+        raw_pred = (
             getattr(result, "response", None)
             or getattr(result, "final_answer", None) or ""
         )
+        import re as _re
+        stripped = _re.sub(r'<think>.*?</think>', '', raw_pred, flags=_re.DOTALL).strip()
+        if not stripped:
+            think_content = "".join(_re.findall(r'<think>(.*?)</think>', raw_pred, _re.DOTALL))
+            letters = _re.findall(r'\b([A-Da-d])\b', think_content)
+            stripped = letters[-1].upper() if letters else raw_pred
+        prediction = stripped
         us = getattr(result, "usage_summary", None) or getattr(result, "usage", None)
         if us is not None:
             input_tokens  = getattr(us, "total_input_tokens", 0)
@@ -411,11 +494,7 @@ def run_sample(
     if hasattr(vllm_client, "avg_ttft"):
         ttft_ms = vllm_client.avg_ttft() * 1000.0
 
-    # O5 — GPU memory from nvidia-smi via vLLM metrics
     gpu_memory_gb = 0.0
-    if kv_after.get("vllm:gpu_cache_usage_perc", 0.0) > 0:
-        # vLLM doesn't expose raw GB directly; estimate from cache usage %
-        gpu_memory_gb = -1.0   # flag as "measured server-side"
 
     em  = exact_match(prediction, gold)
     f1  = f1_score(prediction, gold)
@@ -424,8 +503,7 @@ def run_sample(
 
     return SampleResult(
         model=_HF_MODEL_NAME, dataset="codeqa", sample_id=sample_id, method=method,
-        quantization=quantization,
-        prediction=prediction[:500], ground_truth=gold,
+        prediction=prediction[:1500], ground_truth=gold,
         exact_match=em, f1=f1,
         tokens_used=tokens_used, input_tokens=input_tokens, output_tokens=output_tokens,
         tokens_per_sec=tokens_per_sec, speedup_vs_ollama=speedup,
@@ -441,12 +519,12 @@ def run_sample(
 # Summary tables
 # ---------------------------------------------------------------------------
 
-def _print_summary(results: list[SampleResult], methods: list[str], quantization: str) -> None:
+def _print_summary(results: list[SampleResult], methods: list[str]) -> None:
     from collections import defaultdict
     import statistics
 
     log.info("\n" + "=" * 120)
-    log.info(f"SUMMARY — {_HF_MODEL_NAME} via vLLM | quant={quantization} | CodeQA / LongBench-v2")
+    log.info(f"SUMMARY — {_HF_MODEL_NAME} via vLLM | O4 prefix cache | CodeQA / LongBench-v2")
     log.info("=" * 120)
 
     by_method: dict[str, list[SampleResult]] = defaultdict(list)
@@ -473,7 +551,7 @@ def _print_summary(results: list[SampleResult], methods: list[str], quantization
                  f"{tok:>9.0f} {tps:>7.1f} {spd:>16.2f}x {wt:>8.1f}")
     log.info("-" * len(h1))
 
-    log.info("\n── Table 2: O4/O5 System Metrics ──")
+    log.info("\n── Table 2: O4 System Metrics ──")
     h2 = (f"{'Method':<20} {'TTFT(ms)':>9} {'KV-Hit%':>8} {'O1Chunks':>9} "
           f"{'TokRedux%':>10} {'O3Speedup':>10}")
     log.info(h2); log.info("-" * len(h2))
@@ -500,48 +578,68 @@ def _print_summary(results: list[SampleResult], methods: list[str], quantization
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def _load_samples(n: int, min_chars: int, max_chars: int, seed: int) -> list[dict]:
-    from benchmarks.longbench_codeqa import load_longbench_codeqa
-    import random
-    all_samples = load_longbench_codeqa()
-    filtered = [s for s in all_samples
-                if min_chars <= len(s.get("context", "")) <= max_chars]
-    rng = random.Random(seed)
-    rng.shuffle(filtered)
-    return filtered[:n]
+def _load_samples(n: int, min_chars: int, max_chars: int, seed: int,
+                  difficulties=None, length_labels=None):
+    from benchmarks.longbench_codeqa import CodeQADataset
+    return CodeQADataset(
+        max_samples=n,
+        min_doc_length=min_chars,
+        max_doc_length=max_chars,
+        difficulties=difficulties,
+        length_labels=length_labels,
+        seed=seed,
+    ).load()
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ERLM O4/O5 eval via vLLM on Modal")
+    p = argparse.ArgumentParser(description="ERLM O4 KV-cache eval via vLLM on Modal")
     p.add_argument("--n", type=int, default=50, help="Number of samples")
     p.add_argument("--vllm_url", required=True,
                    help="Modal vLLM endpoint URL (from `modal serve modal_vllm_server.py`)")
-    p.add_argument("--quantization", default="none", choices=["none", "int8", "fp8"],
-                   help="Quantization mode the vLLM server was started with (for logging)")
+    p.add_argument("--model_name", default=None,
+                   help="HF model name override (default: Qwen/Qwen3-8B). "
+                        "Use for 30B: --model_name Qwen/Qwen3-30B-A3B")
     p.add_argument("--methods", nargs="+",
-                   default=["base_model", "rlm_baseline", "erlm_o1o2", "erlm_o1o2o3"],
-                   choices=["base_model", "rlm_baseline", "erlm_o1o2", "erlm_o1o2o3"])
+                   default=["base_model", "rlm_baseline", "erlm_o1o2", "erlm_o1o2o3", "erlm_o1o2o3o4"],
+                   choices=["base_model", "rlm_baseline", "erlm_o1o2", "erlm_o1o2o3", "erlm_o1o2o3o4"])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out_dir", default="results/vllm_qwen3_8b")
+    p.add_argument("--max_doc_chars", type=int, default=None,
+                   help="Override max doc length (default: 120000)")
+    p.add_argument("--min_doc_chars", type=int, default=None,
+                   help="Override min doc length (default: 50000)")
+    p.add_argument("--difficulty", nargs="+", default=None,
+                   choices=["easy", "hard"],
+                   help="Filter by difficulty (e.g. --difficulty easy)")
+    p.add_argument("--length_label", nargs="+", default=None,
+                   choices=["short", "medium", "long"],
+                   help="Filter by dataset length label (e.g. --length_label medium)")
+    p.add_argument("--out_dir", default=None,
+                   help="Output directory (auto-derived from model_name if not set)")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    quant = args.quantization
-    label = f"{_MODEL_LABEL}_{quant}" if quant != "none" else _MODEL_LABEL
+    # Allow model name override (e.g. for 30B-A3B) — propagates to all builder fns
+    global _HF_MODEL_NAME
+    if args.model_name:
+        _HF_MODEL_NAME = args.model_name
+    hf_model = _HF_MODEL_NAME
+    model_slug = hf_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    base_label = f"vllm_{model_slug}"
+    label = base_label
+    out_dir = args.out_dir if args.out_dir else f"results/{base_label}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     global log
-    log = _setup_logging(args.out_dir, ts, label)
+    log = _setup_logging(out_dir, ts, label)
 
     log.info("=" * 70)
-    log.info(f"Model          : {_HF_MODEL_NAME}")
+    log.info(f"Model          : {hf_model}")
     log.info(f"Backend        : vLLM on Modal ({args.vllm_url})")
-    log.info(f"Quantization   : {quant}")
     log.info(f"O4 KV Cache    : enabled (server-side via --enable-prefix-caching)")
     log.info(f"Context window : 128K tokens ≈ 480K chars")
     log.info(f"Base-model cap : {_BASE_MODEL_DOC_CHARS:,} chars")
@@ -550,23 +648,33 @@ def main() -> None:
     log.info(f"Doc length     : {_MIN_DOC_LENGTH:,} – {_MAX_DOC_LENGTH:,} chars")
     log.info(f"Max iterations : {_MAX_ITERATIONS}")
     log.info(f"Timeout/sample : {_MAX_TIMEOUT_S}s")
-    log.info(f"Output dir     : {args.out_dir}")
+    log.info(f"Output dir     : {out_dir}")
     log.info("=" * 70)
 
     # Shared vLLM client (tracks TTFT across all calls)
-    vllm_client = _make_vllm_client(args.vllm_url, quant)
+    vllm_client = _make_vllm_client(args.vllm_url)
     bkw = _make_backend_kwargs(args.vllm_url)
 
-    samples = _load_samples(args.n, _MIN_DOC_LENGTH, _MAX_DOC_LENGTH, args.seed)
+    min_doc = args.min_doc_chars if args.min_doc_chars else _MIN_DOC_LENGTH
+    max_doc = args.max_doc_chars if args.max_doc_chars else _MAX_DOC_LENGTH
+    samples = _load_samples(args.n, min_doc, max_doc, args.seed,
+                            difficulties=args.difficulty,
+                            length_labels=args.length_label)
     log.info(f"Loaded {len(samples)} samples. Running {len(args.methods)} methods…")
 
     results: list[SampleResult] = []
 
     for i, sample in enumerate(samples, 1):
-        doc       = sample.get("context", "")
-        question  = sample.get("input", "")
-        gold      = sample.get("answers", [""])[0] if isinstance(sample.get("answers"), list) else sample.get("answers", "")
-        sample_id = sample.get("_id", f"sample_{i}")
+        doc       = sample.document
+        gold      = sample.answer
+        sample_id = sample.id
+        # Format question with MC options so model knows what A/B/C/D mean
+        choices = sample.choices
+        if choices:
+            opts = "\n".join(f"{k}. {v}" for k, v in sorted(choices.items()))
+            question = f"{sample.question}\n\n{opts}"
+        else:
+            question = sample.question
 
         log.info(f"[codeqa] Sample {i}/{len(samples)} id={sample_id}  "
                  f"doc_chars={len(doc):,}  q={question[:80]!r}")
@@ -574,8 +682,9 @@ def main() -> None:
         method_fns = {
             "base_model":    lambda: build_base_model(vllm_client),
             "rlm_baseline":  lambda: build_rlm_baseline(bkw),
-            "erlm_o1o2":     lambda: build_erlm(bkw, o1=True, o2=True, o3=False),
-            "erlm_o1o2o3":   lambda: build_erlm(bkw, o1=True, o2=True, o3=True),
+            "erlm_o1o2":     lambda: build_erlm(bkw, o1=True, o2=True, o3=False, o4=False),
+            "erlm_o1o2o3":   lambda: build_erlm(bkw, o1=True, o2=True, o3=True,  o4=False),
+            "erlm_o1o2o3o4": lambda: build_erlm(bkw, o1=True, o2=True, o3=True,  o4=True),
         }
 
         for method in args.methods:
@@ -584,7 +693,7 @@ def main() -> None:
                 model_fn=method_fns[method],
                 document=doc, question=question, gold=gold,
                 sample_id=sample_id, method=method,
-                vllm_url=args.vllm_url, quantization=quant,
+                vllm_url=args.vllm_url,
                 vllm_client=vllm_client,
             )
             results.append(r)
@@ -596,15 +705,15 @@ def main() -> None:
             if r.error:
                 log.warning(f"  ✗ {method}: {r.error}")
 
-    _print_summary(results, args.methods, quant)
+    _print_summary(results, args.methods)
 
     # Save results
-    os.makedirs(args.out_dir, exist_ok=True)
-    jsonl_path = os.path.join(args.out_dir, f"{label}_{ts}.jsonl")
+    os.makedirs(out_dir, exist_ok=True)
+    jsonl_path = os.path.join(out_dir, f"{label}_{ts}.jsonl")
     with open(jsonl_path, "w") as f:
         for r in results:
             f.write(json.dumps(asdict(r)) + "\n")
-    log.info(f"\nResults saved to {args.out_dir}/")
+    log.info(f"\nResults saved to {out_dir}/  ({jsonl_path})")
 
 
 if __name__ == "__main__":

@@ -24,17 +24,21 @@ class CodeQASample:
         id: Unique identifier for the sample.
         document: The long code context (may span a multi-file repo).
         question: The question posed about the code context.
-        answer: Ground-truth answer string.
+        choices: Dict with keys A/B/C/D mapping to option text.
+        answer: Ground-truth answer letter (A/B/C/D).
         length: Document length in characters.
         difficulty: Difficulty tier — "easy", "medium", or "hard".
+        length_label: Dataset length label — "short"/"medium"/"long".
     """
 
     id: str
     document: str
     question: str
+    choices: dict  # {"A": "...", "B": "...", "C": "...", "D": "..."}
     answer: str
     length: int
     difficulty: str
+    length_label: str = ""
 
 
 class CodeQADataset:
@@ -66,6 +70,8 @@ class CodeQADataset:
         min_doc_length: int = _CONTEXT_WINDOW_CHARS,
         max_doc_length: int = 10_000_000,
         domains: list[str] | None = None,  # None = all domains
+        difficulties: list[str] | None = None,  # e.g. ["easy"] or ["easy","hard"]
+        length_labels: list[str] | None = None,  # e.g. ["medium"] or ["short","medium"]
         seed: int = 42,
     ) -> None:
         self.max_samples = max_samples
@@ -77,6 +83,8 @@ class CodeQADataset:
             "Multi-Document QA",
             "Single-Document QA",
         ]
+        self.difficulties = difficulties  # None = no filter
+        self.length_labels = length_labels  # None = no filter
         self.seed = seed
         self._samples: list[CodeQASample] = []
 
@@ -114,6 +122,13 @@ class CodeQADataset:
         len_col = next((c for c in ["length", "doc_length"] if c in columns), None)
         diff_col = next((c for c in ["difficulty", "level"] if c in columns), None)
         domain_col = next((c for c in ["domain", "type", "task_type"] if c in columns), None)
+        # Multiple-choice option columns
+        choice_cols = {
+            "A": next((c for c in ["choice_A", "choiceA", "option_A", "A"] if c in columns), None),
+            "B": next((c for c in ["choice_B", "choiceB", "option_B", "B"] if c in columns), None),
+            "C": next((c for c in ["choice_C", "choiceC", "option_C", "C"] if c in columns), None),
+            "D": next((c for c in ["choice_D", "choiceD", "option_D", "D"] if c in columns), None),
+        }
 
         if ctx_col is None:
             warnings.warn(
@@ -129,6 +144,16 @@ class CodeQADataset:
                 domain_val = str(row.get(domain_col, ""))
                 if domain_val not in self.domains:
                     continue
+
+            # Filter by difficulty label
+            difficulty_val = str(row.get(diff_col, "")) if diff_col else ""
+            if self.difficulties and difficulty_val not in self.difficulties:
+                continue
+
+            # Filter by length label ("short"/"medium"/"long")
+            length_label_val = str(row.get(len_col, "")) if len_col else ""
+            if self.length_labels and length_label_val not in self.length_labels:
+                continue
 
             document: str = self._resolve_column(row, [ctx_col] if ctx_col else [])
             # Always use actual character length for filtering — the 'length'
@@ -146,13 +171,21 @@ class CodeQADataset:
             else:
                 answer = str(raw_answer) if raw_answer is not None else ""
 
+            # Load multiple-choice options
+            choices: dict = {}
+            for letter, col in choice_cols.items():
+                if col and col in row and row[col] is not None:
+                    choices[letter] = str(row[col])
+
             sample = CodeQASample(
                 id=self._resolve_column(row, [id_col] if id_col else [], fallback=str(len(samples))),
                 document=document,
                 question=self._resolve_column(row, [q_col] if q_col else []),
+                choices=choices,
                 answer=answer,
                 length=doc_len,
-                difficulty=self._resolve_column(row, [diff_col] if diff_col else [], fallback="unknown"),
+                difficulty=difficulty_val or "unknown",
+                length_label=length_label_val,
             )
             samples.append(sample)
 

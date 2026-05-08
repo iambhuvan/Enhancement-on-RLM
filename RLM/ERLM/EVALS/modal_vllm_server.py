@@ -1,9 +1,8 @@
 """
-modal_vllm_server.py — vLLM server on Modal GPU for O4/O5 benchmarking
-=======================================================================
+modal_vllm_server.py — vLLM server on Modal GPU for O4 benchmarking
+=====================================================================
 Deploys Qwen/Qwen3-8B on a Modal GPU with:
   - O4: --enable-prefix-caching (RadixAttention KV reuse)
-  - O5: --quantization int8 (A100) or fp8 (H100)
 
 Exposes an OpenAI-compatible endpoint that run_vllm_qwen3.py connects to.
 
@@ -15,13 +14,10 @@ Usage
     # One-shot run (terminates after idle):
     modal run modal_vllm_server.py
 
-    # With FP8 (H100):
-    QUANTIZATION=fp8 modal serve modal_vllm_server.py
-
 GPU options (set GPU env var or edit _GPU below):
-    A10G  — 24 GB VRAM, ~$0.50/hr — BF16 or INT8
-    A100  — 40 GB VRAM, ~$2.80/hr — BF16 or INT8
-    H100  — 80 GB VRAM, ~$4.50/hr — FP8 (native)
+    A10G  — 24 GB VRAM, ~$0.50/hr
+    A100  — 40 GB VRAM, ~$2.80/hr
+    H100  — 80 GB VRAM, ~$4.50/hr
 
 After `modal serve` prints the URL, pass it to run_vllm_qwen3.py:
     python run_vllm_qwen3.py --n 50 --vllm_url https://YOUR-MODAL-URL
@@ -40,10 +36,9 @@ import modal
 # ---------------------------------------------------------------------------
 
 _MODEL        = os.environ.get("MODEL", "Qwen/Qwen3-8B")
-_QUANTIZATION = os.environ.get("QUANTIZATION", "none")   # "none" | "int8" | "fp8"
-_GPU          = os.environ.get("GPU", "A10G")            # "A10G" | "A100" | "H100"
+_GPU          = os.environ.get("GPU", "A100")            # A10G=24GB (too small), A100=40GB, H100=80GB
 _PORT         = 8000
-_MAX_MODEL_LEN = 131072   # 128K context
+_MAX_MODEL_LEN = 32768    # 32K — fits in A100's KV cache budget after model weights
 
 # ---------------------------------------------------------------------------
 # Modal image — vLLM + HF transfer
@@ -58,7 +53,10 @@ _image = (
         "huggingface_hub[hf_transfer]>=0.22.0",
         "httpx",
     )
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",   # Qwen3 RoPE scaling: config says 40960 but supports 131072
+    })
 )
 
 # Persistent volume — caches model weights across runs (avoids re-downloading 16 GB)
@@ -75,9 +73,9 @@ app = modal.App("erlm-vllm-qwen3")
     gpu=_GPU,
     volumes={"/models": _vol},
     timeout=7_200,               # 2 hr max session
-    container_idle_timeout=600,  # keep alive 10 min after last request
-    allow_concurrent_inputs=32,
+    scaledown_window=3600,       # keep alive 1 hr — long inference takes time
 )
+@modal.concurrent(max_inputs=32)
 @modal.web_server(_PORT, startup_timeout=300)
 def serve() -> None:
     """
@@ -94,11 +92,8 @@ def serve() -> None:
         "--gpu-memory-utilization", "0.85",
         "--max-model-len", str(_MAX_MODEL_LEN),
         "--trust-remote-code",
-        "--disable-log-requests",
+        "--no-enable-log-requests",
     ]
-
-    if _QUANTIZATION != "none":
-        cmd += ["--quantization", _QUANTIZATION]   # O5: int8 or fp8
 
     print(f"[modal_vllm_server] Starting: {' '.join(cmd)}")
     subprocess.Popen(cmd)
@@ -128,7 +123,6 @@ def main() -> None:
     print("\n" + "=" * 70)
     print(f"  Model        : {_MODEL}")
     print(f"  GPU          : {_GPU}")
-    print(f"  Quantization : {_QUANTIZATION}")
     print(f"  Max ctx len  : {_MAX_MODEL_LEN:,} tokens")
     print("=" * 70)
     print("\nRun with:  modal serve modal_vllm_server.py")
